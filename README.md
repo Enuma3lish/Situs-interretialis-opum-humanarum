@@ -51,6 +51,7 @@ Demo of human resource like Taiwan's 104
 +------------------------------------+
 
 # Docker Architecture
+
 +-------------------+
 |   docker-compose  |
 +--------+----------+
@@ -61,3 +62,4 @@ Demo of human resource like Taiwan's 104
 |Vue | |Golang|  |Postgre|  |Redis | |Nginx |
 |App | |API   |  |SQL DB |  |Cache | |proxy |
 +----+ +------+  +-------+  +------+ +------+
+
