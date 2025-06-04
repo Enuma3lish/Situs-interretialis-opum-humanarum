@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -34,10 +36,20 @@ type Job struct {
 
 func (Job) TableName() string { return "job" }
 
+type User struct {
+	ID           uint   `gorm:"primaryKey"`
+	Username     string `gorm:"unique;size:64"`
+	PasswordHash string
+	IsAdmin      bool `gorm:"default:false"`
+}
+
+func (User) TableName() string { return "users" }
+
 var (
-	DB  *gorm.DB
-	RDB *redis.Client
-	ctx = context.Background()
+	DB        *gorm.DB
+	RDB       *redis.Client
+	ctx       = context.Background()
+	jwtSecret = []byte("your-secret-key") // 建議用環境變數設定
 )
 
 // ----- DB/Redis Init -----
@@ -88,27 +100,129 @@ func initRedis() {
 	}
 }
 
-// ----- Handlers -----
+// ----- Auth Handlers -----
+
+func RegisterHandler(c *gin.Context) {
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := c.BindJSON(&req); err != nil || req.Username == "" || req.Password == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid params"})
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "hash error"})
+		return
+	}
+	user := User{Username: req.Username, PasswordHash: string(hash)}
+	if err := DB.Create(&user).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user exists"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"msg": "註冊成功"})
+}
+
+func LoginHandler(c *gin.Context) {
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid params"})
+		return
+	}
+	var user User
+	if err := DB.Where("username = ?", req.Username).First(&user).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "帳號或密碼錯誤"})
+		return
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "帳號或密碼錯誤"})
+		return
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id":  user.ID,
+		"is_admin": user.IsAdmin,
+		"exp":      time.Now().Add(24 * time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString(jwtSecret)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "token error"})
+		return
+	}
+	// 回傳 is_admin, user_id 讓前端存
+	c.JSON(http.StatusOK, gin.H{"token": tokenString, "is_admin": user.IsAdmin, "user_id": user.ID})
+}
+
+// ---- JWT Middleware ----
+func AuthMiddleware(requireAdmin bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		auth := c.GetHeader("Authorization")
+		if len(auth) < 8 || auth[:7] != "Bearer " {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "No token"})
+			return
+		}
+		tokenStr := auth[7:]
+		token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			return
+		}
+		claims, ok := token.Claims.(jwt.MapClaims)
+		if !ok || !token.Valid {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			return
+		}
+		if requireAdmin {
+			isAdmin, ok := claims["is_admin"].(bool)
+			if !ok {
+				f, ok2 := claims["is_admin"].(float64)
+				if ok2 && f == 1 {
+					isAdmin = true
+				}
+			}
+			if !isAdmin {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "管理員限定"})
+				return
+			}
+		}
+		c.Set("user_id", claims["user_id"])
+		c.Set("is_admin", claims["is_admin"])
+		c.Next()
+	}
+}
+
+// ----- Job Handlers -----
 
 func GetJobs(c *gin.Context) {
+	keyword := c.Query("keyword")
 	redisKey := "jobs:all"
+	if keyword != "" {
+		redisKey = "jobs:search:" + keyword
+	}
 
-	// 1. Try to get from cache
 	data, err := RDB.Get(ctx, redisKey).Bytes()
 	if err == nil {
-		// Found in cache, refresh TTL
 		RDB.Expire(ctx, redisKey, 10*time.Minute)
 		var jobs []map[string]interface{}
 		if err := json.Unmarshal(data, &jobs); err == nil {
 			c.JSON(http.StatusOK, jobs)
 			return
 		}
-		// Unmarshal error, fallback to DB
 	}
 
-	// 2. Get from DB
 	var jobs []Job
-	if err := DB.Preload("Company").Find(&jobs).Error; err != nil {
+	q := DB.Preload("Company")
+	if keyword != "" {
+		// 關鍵字搜尋同時查公司名稱與職缺名稱
+		q = q.Joins("JOIN company ON company.id = job.company_id").
+			Where("job.title ILIKE ? OR company.name ILIKE ?", "%"+keyword+"%", "%"+keyword+"%")
+	}
+	if err := q.Find(&jobs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -123,8 +237,6 @@ func GetJobs(c *gin.Context) {
 			"salary_max": job.SalaryMax,
 		})
 	}
-
-	// 3. Cache the result with 10 min TTL
 	encoded, _ := json.Marshal(result)
 	RDB.Set(ctx, redisKey, encoded, 10*time.Minute)
 	c.JSON(http.StatusOK, result)
@@ -152,9 +264,72 @@ func CreateJob(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "create job failed"})
 		return
 	}
-	// 刪快取
+	// 刪所有相關快取
 	RDB.Del(ctx, "jobs:all")
+	RDB.Del(ctx, "jobs:search:"+req.Title)
 	c.JSON(http.StatusOK, job)
+}
+
+func DeleteJob(c *gin.Context) {
+	id := c.Param("id")
+	if err := DB.Delete(&Job{}, id).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "刪除失敗"})
+		return
+	}
+	RDB.Del(ctx, "jobs:all")
+	c.JSON(http.StatusOK, gin.H{"msg": "已刪除"})
+}
+
+// 公司統計
+func GetCompanyStat(c *gin.Context) {
+	type Stat struct {
+		Company    string  `json:"company"`
+		AvgSalary  float64 `json:"avg_salary"`
+		HighSalary int     `json:"high_salary"`
+	}
+	var stats []Stat
+	DB.Raw(`
+		SELECT c.name as company,
+			ROUND(AVG((j.salary_min + j.salary_max) / 2)) as avg_salary,
+			SUM(CASE WHEN j.salary_min > 100000 THEN 1 ELSE 0 END) as high_salary
+		FROM company c
+		JOIN job j ON c.id = j.company_id
+		GROUP BY c.name
+		ORDER BY c.name
+	`).Scan(&stats)
+	c.JSON(http.StatusOK, stats)
+}
+
+// ------ User 管理 (admin only) --------
+
+type SimpleUser struct {
+	ID       uint   `json:"id"`
+	Username string `json:"username"`
+	IsAdmin  bool   `json:"is_admin"`
+}
+
+func ListUsers(c *gin.Context) {
+	var users []SimpleUser
+	if err := DB.Model(&User{}).Select("id, username, is_admin").Scan(&users).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, users)
+}
+
+func DeleteUser(c *gin.Context) {
+	id := c.Param("id")
+	// 防止 admin 刪自己
+	userID := fmt.Sprintf("%v", c.MustGet("user_id"))
+	if userID == id {
+		c.JSON(http.StatusForbidden, gin.H{"error": "不能刪除自己"})
+		return
+	}
+	if err := DB.Delete(&User{}, id).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "刪除失敗"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"msg": "帳號已刪除"})
 }
 
 func main() {
@@ -162,8 +337,25 @@ func main() {
 	initRedis()
 
 	r := gin.Default()
-	r.GET("/jobs", GetJobs)
-	r.POST("/jobs", CreateJob) // for testing
+	// Auth API
+	r.POST("/api/register", RegisterHandler)
+	r.POST("/api/login", LoginHandler)
+
+	api := r.Group("/api")
+	api.Use(AuthMiddleware(false))
+	{
+		api.GET("/jobs", GetJobs)
+		api.GET("/companies/stat", GetCompanyStat)
+	}
+
+	admin := r.Group("/api")
+	admin.Use(AuthMiddleware(true))
+	{
+		admin.POST("/jobs", CreateJob)
+		admin.DELETE("/jobs/:id", DeleteJob)
+		admin.GET("/users", ListUsers)
+		admin.DELETE("/users/:id", DeleteUser)
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
